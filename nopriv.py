@@ -199,6 +199,19 @@ def decode_string(string):
     raise DecodeError("Could not decode string")
 
 
+def header_first(header_value):
+    """Return first (decoded_string, charset) for a header value, safely handling None."""
+    if header_value is None:
+        return "", None
+    try:
+        parts = decode_header(header_value)
+        if parts and len(parts) > 0:
+            return parts[0]
+    except Exception:
+        pass
+    return header_value, None
+
+
 attCount = 0
 lastAttName = ""
 att_count = 0
@@ -219,7 +232,7 @@ def saveToMaildir(msg, mailFolder):
         maildir_message = folder.get_message(message_key)
         try:
             message_date_epoch = time.mktime(
-                parsedate(decode_header(maildir_message.get("Date"))[0][0])
+                parsedate(header_first(maildir_message.get("Date"))[0])
             )
         except TypeError:
             message_date_epoch = time.mktime([2000, 1, 1, 1, 1, 1, 1, 1, 0])
@@ -260,19 +273,25 @@ def getLastMailID(folder, email_address, filename="nopriv.txt"):
     with open(os.path.join(filename), "r") as progress_file:
         for line in progress_file:
             if len(line) > 3:
-                latest_mailid = line.split(":")[2]
-                email_addres_from_file = line.split(":")[1]
-                folder_name = line.split(":")[0]
-                if folder_name == folder and email_addres_from_file == email_address:
-                    progress_file.close()
-                    return latest_mailid
+                parts = line.rstrip("\n").split(":")
+                if len(parts) >= 3:
+                    folder_name = parts[0]
+                    email_addres_from_file = parts[1]
+                    latest_mailid = parts[2]
+                    if folder_name == folder and email_addres_from_file == email_address:
+                        try:
+                            return int(latest_mailid)
+                        except Exception:
+                            return 0
         return 0
-        progress_file.close()
 
 
 def get_messages_to_local_maildir(mailFolder, mail, startid=1):
     global IMAPLOGIN
-    mail.select(mailFolder, readonly=True)
+    typ_select, data_select = mail.select(mailFolder, readonly=True)
+    if typ_select is None or typ_select.upper() != "OK":
+        print("Error selecting IMAP folder '%s': %s" % (mailFolder, data_select))
+        return
     try:
         typ, mdata = mail.search(None, "ALL")
     except Exception as imaperror:
@@ -290,12 +309,12 @@ def get_messages_to_local_maildir(mailFolder, mail, startid=1):
         startid = 1
 
     for message_id in range(int(startid), int(total_messages_in_mailbox + 1)):
-        result, data = mail.fetch(message_id, "(RFC822)")
+        result, data = mail.fetch(str(message_id), "(RFC822)")
         raw_email = data[0][1]
         print("Saving message %s." % (message_id))
         maildir_folder = mailFolder.replace("/", ".")
         saveToMaildir(raw_email, maildir_folder)
-    if incremental_backup:
+        if incremental_backup:
             saveMostRecentMailID(message_id, IMAPLOGIN, mailFolder)
 
 
@@ -356,6 +375,12 @@ def allFolders(IMAPFOLDER_ORIG, mail):
     if len(IMAPFOLDER_ORIG) == 1 and IMAPFOLDER_ORIG[0] == "NoPriv_All":
         maillist = mail.list()
         for imapFolder in sorted(maillist[1]):
+            # imaplib may return bytes; ensure string
+            if isinstance(imapFolder, bytes):
+                try:
+                    imapFolder = imapFolder.decode("utf-8", errors="replace")
+                except Exception:
+                    imapFolder = imapFolder.decode(errors="replace")
             imapFolder = re.sub(r"(?i)\(.*\)", "", imapFolder, flags=re.DOTALL)
             imapFolder = re.sub(r"(?i)\".\"", "", imapFolder, flags=re.DOTALL)
             imapFolder = re.sub(r"(?i)\"", "", imapFolder, flags=re.DOTALL)
@@ -373,6 +398,8 @@ def returnImapFolders(available=True, selected=True, html=False):
             response += "Available IMAP4 folders:\n"
         maillist = mail.list()
         for ifo in sorted(maillist[1]):
+            if isinstance(ifo, bytes):
+                ifo = ifo.decode("utf-8", errors="replace")
             ifo = re.sub(r"(?i)\(.*\)", "", ifo, flags=re.DOTALL)
             ifo = re.sub(r"(?i)\".\"", "", ifo, flags=re.DOTALL)
             ifo = re.sub(r"(?i)\"", "", ifo, flags=re.DOTALL)
@@ -862,25 +889,23 @@ def save_mail_attachments_to_folders(mail_id, mail, local_folder, folder):
         if part.get("Content-Disposition") is None:
             continue
         decoded_filename = part.get_filename()
-        filename_header = None
+        # Safely decode potential RFC2047 encoded filenames and handle None
         try:
-            filename_header = decode_header(part.get_filename())
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            filename_header = None
+            raw_filename = header_first(decoded_filename)[0]
+        except Exception:
+            raw_filename = decoded_filename or ""
 
-        if filename_header:
-            filename_header = filename_header[0][0]
-            att_filename = re.sub(
-                r"[^.a-zA-Z0-9 :;,\.\?]",
-                "_",
-                filename_header.replace(":", "").replace("/", "").replace("\\", ""),
-            )
-        else:
-            att_filename = re.sub(
-                r"[^.a-zA-Z0-9 :;,\.\?]",
-                "_",
-                (decoded_filename or "").replace(":", "").replace("/", "").replace("\\", ""),
-            )
+        try:
+            # normalize bytes/str to a safe ascii string
+            normalized_filename = decode_string(raw_filename)
+        except Exception:
+            normalized_filename = raw_filename or ""
+
+        att_filename = re.sub(
+            r"[^.a-zA-Z0-9 :;,\.\?]",
+            "_",
+            normalized_filename.replace(":", "").replace("/", "").replace("\\", ""),
+        )
 
         if last_att_filename == att_filename:
             att_filename = str(att_count) + "." + att_filename
@@ -1013,8 +1038,8 @@ def backup_mails_to_html_from_local_maildir(folder):
 
         mail = sorted_maildir[number]
         mail_for_page = sorted_maildir[number]
-        mail_subject = decode_header(mail.get("Subject"))[0][0]
-        mail_subject_encoding = decode_header(mail.get("Subject"))[0][1]
+        mail_subject = header_first(mail.get("Subject"))[0]
+        mail_subject_encoding = header_first(mail.get("Subject"))[1]
         if not mail_subject_encoding:
             mail_subject_encoding = "utf-8"
 
@@ -1023,16 +1048,16 @@ def backup_mails_to_html_from_local_maildir(folder):
 
         mail_from = email.utils.parseaddr(mail.get("From"))[1]
 
-        mail_from_encoding = decode_header(mail.get("From"))[0][1]
+        mail_from_encoding = header_first(mail.get("From"))[1]
         if not mail_from_encoding:
             mail_from_encoding = "utf-8"
 
         mail_to = email.utils.parseaddr(mail.get("To"))[1]
-        mail_to_encoding = decode_header(mail.get("To"))[0][1]
+        mail_to_encoding = header_first(mail.get("To"))[1]
         if not mail_to_encoding:
             mail_to_encoding = "utf-8"
 
-        mail_date = decode_header(mail.get("Date"))[0][0]
+        mail_date = header_first(mail.get("Date"))[0]
 
         addMailToOverviewPage(
             folder,
@@ -1088,9 +1113,16 @@ def backup_mails_to_html_from_local_maildir(folder):
 returnWelcome()
 
 if not offline:
-    mail = connectToImapMailbox(IMAPSERVER, IMAPLOGIN, IMAPPASSWORD)
-    IMAPFOLDER = allFolders(IMAPFOLDER_ORIG, mail)
-    print(returnImapFolders())
+    try:
+        mail = connectToImapMailbox(IMAPSERVER, IMAPLOGIN, IMAPPASSWORD)
+        IMAPFOLDER = allFolders(IMAPFOLDER_ORIG, mail)
+        print(returnImapFolders())
+    except Exception as e:
+        # Authentication/connect error — fall back to offline mode
+        print("IMAP connection failed: %s" % (e,))
+        print("Falling back to offline mode. Fix credentials or set 'offline = true' in nopriv.ini to skip IMAP.")
+        offline = True
+        mail = None
 
 returnIndexPage()
 
