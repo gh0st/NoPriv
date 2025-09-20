@@ -25,15 +25,14 @@ import re
 from math import ceil
 from random import choice
 import os
-import base64
-import cgi
+import html
 import sys
 import shutil
 import errno
 import datetime
 import fileinput
-import ConfigParser
-from quopri import decodestring
+import configparser as ConfigParser
+import quopri
 import getpass
 
 # places where the config could be located
@@ -52,7 +51,7 @@ for conf_file in config_file_paths:
         config.read(conf_file)
         found = True
         break
-if found == False:
+if not found:
     message = "No config file found. Expected places: %s" % (
         "\n".join(config_file_paths),
     )
@@ -79,23 +78,25 @@ try:
     ssl_value = config.get("nopriv", "ssl")
     if ssl_value in yes_flags:
         ssl = True
-except:
+except Exception:
     pass
+
 
 incremental_backup = False
 try:
     incremental_value = config.get("nopriv", "incremental_backup")
     if incremental_value in yes_flags:
         incremental_backup = True
-except:
+except Exception:
     pass
+
 
 offline = False
 try:
     offline_value = config.get("nopriv", "offline")
     if offline_value in yes_flags:
         offline = True
-except:
+except Exception:
     pass
 
 enable_html = True
@@ -165,18 +166,34 @@ class DecodeError(Exception):
 
 
 def decode_string(string):
-    for charset in (
-        "utf-8",
-        "latin-1",
-        "iso-8859-1",
-        "us-ascii",
-        "windows-1252",
-        "us-ascii",
-    ):
+    # Robustly decode bytes/str to a safe ASCII-represented string
+    def to_str(val, enc=None):
+        if val is None:
+            return ""
+        if isinstance(val, str):
+            return val
+        if isinstance(val, bytes):
+            if enc:
+                try:
+                    return val.decode(enc)
+                except Exception:
+                    pass
+            for charset in ("utf-8", "latin-1", "iso-8859-1", "cp1252", "ascii"):
+                try:
+                    return val.decode(charset)
+                except Exception:
+                    continue
+            return val.decode("utf-8", "ignore")
+
+    def escape_and_asciify(s):
+        # Escape HTML special chars and convert non-ascii to numeric character refs
+        escaped = html.escape(s)
+        return escaped.encode("ascii", "xmlcharrefreplace").decode("ascii")
+
+    for charset in ("utf-8", "latin-1", "iso-8859-1", "us-ascii", "windows-1252"):
         try:
-            return cgi.escape(unicode(string, charset)).encode(
-                "ascii", "xmlcharrefreplace"
-            )
+            text = to_str(string, charset)
+            return escape_and_asciify(text)
         except Exception:
             continue
     raise DecodeError("Could not decode string")
@@ -204,7 +221,7 @@ def saveToMaildir(msg, mailFolder):
             message_date_epoch = time.mktime(
                 parsedate(decode_header(maildir_message.get("Date"))[0][0])
             )
-        except TypeError as typeerror:
+        except TypeError:
             message_date_epoch = time.mktime([2000, 1, 1, 1, 1, 1, 1, 1, 0])
         maildir_message.set_date(message_date_epoch)
         maildir_message.add_flag("s")
@@ -228,7 +245,7 @@ def saveMostRecentMailID(mail_id, email_address, folder, filename="nopriv.txt"):
         if len(line) > 3 and line != "\n":
             print(line)
     fileinput.close()
-    if match == False:
+    if not match:
         with open(os.path.join(filename), "a") as progress_file:
             progress_file.write(folder + ":" + email_address + ":" + str(mail_id))
             progress_file.close()
@@ -239,7 +256,7 @@ def getLastMailID(folder, email_address, filename="nopriv.txt"):
         with open(os.path.join(filename), "w") as progress_file:
             progress_file.write(folder + ":" + email_address + ":1")
             progress_file.close()
-    match = False
+    # removed unused 'match' variable from here
     with open(os.path.join(filename), "r") as progress_file:
         for line in progress_file:
             if len(line) > 3:
@@ -264,14 +281,9 @@ def get_messages_to_local_maildir(mailFolder, mail, startid=1):
         return
 
     total_messages_in_mailbox = len(mdata[0].split())
-    last_mail_id = 0
-    try:
-        last_mail_id = mdata[0].split()[-1]
-    except Exception:
-        pass
     folder_most_recent_id = getLastMailID(mailFolder, IMAPLOGIN)
 
-    if folder_most_recent_id > 2 and incremental_backup == True:
+    if folder_most_recent_id > 2 and incremental_backup:
         if not int(folder_most_recent_id) == 1:
             startid = int(folder_most_recent_id) + 1
     if startid == 0:
@@ -283,7 +295,7 @@ def get_messages_to_local_maildir(mailFolder, mail, startid=1):
         print("Saving message %s." % (message_id))
         maildir_folder = mailFolder.replace("/", ".")
         saveToMaildir(raw_email, maildir_folder)
-        if incremental_backup == True:
+    if incremental_backup:
             saveMostRecentMailID(message_id, IMAPLOGIN, mailFolder)
 
 
@@ -392,7 +404,6 @@ def returnMenu(folderImIn, inDate=False, index=False, vertical=False, activeItem
     global IMAPFOLDER
 
     folder_number = folderImIn.split("/")
-    current_folder = folder_number
     folder_number = len(folder_number)
     dotdotslash = ""
 
@@ -526,30 +537,25 @@ def addMailToOverviewPage(
     attachment=False,
     emptyFolder=False,
 ):
+    # Normalize and escape incoming values to str
     try:
-        mail_subject = cgi.escape(unicode(mail_subject, mail_subject_encoding)).encode(
-            "ascii", "xmlcharrefreplace"
-        )
-        mail_to = cgi.escape(unicode(mail_to, mail_to_encoding)).encode(
-            "ascii", "xmlcharrefreplace"
-        )
-        mail_from = cgi.escape(unicode(mail_from, mail_from_encoding)).encode(
-            "ascii", "xmlcharrefreplace"
-        )
-    except Exception:
         mail_subject = decode_string(mail_subject)
+    except Exception:
+        mail_subject = ""
+    try:
         mail_to = decode_string(mail_to)
+    except Exception:
+        mail_to = ""
+    try:
         mail_from = decode_string(mail_from)
+    except Exception:
+        mail_from = ""
 
     try:
-        email_date = str(
-            time.strftime("%d-%m-%Y %H:%m", email.utils.parsedate(mail_date))
-        )
         attachment_folder_date = str(
             time.strftime("%Y/%m/", email.utils.parsedate(mail_date))
         )
     except TypeError:
-        email_date = "Error in Date"
         attachment_folder_date = str("2000/1/")
 
     email_file_path = os.path.join(attachment_folder_date, str(mail_id), "index.html")
@@ -560,7 +566,8 @@ def addMailToOverviewPage(
         overview_file.write("<tr>\n\t\t<td>")
         overview_file.write(str(mail_id))
         overview_file.write("</td>\n\t\t<td>")
-        overview_file.write(mail_from.decode("string-escape"))
+        # mail_from is already normalized to a safe string
+        overview_file.write(mail_from)
         overview_file.write("</td>\n\t\t<td>")
         overview_file.write(mail_to)
         overview_file.write("</td>\n\t\t<td>")
@@ -637,20 +644,19 @@ def createMailPage(
 ):
     mail = mail_for_page
 
+    # Normalize header strings
     try:
-        mail_subject = cgi.escape(unicode(mail_subject, mail_subject_encoding)).encode(
-            "ascii", "xmlcharrefreplace"
-        )
-        mail_to = cgi.escape(unicode(mail_to, mail_to_encoding)).encode(
-            "ascii", "xmlcharrefreplace"
-        )
-        mail_from = cgi.escape(unicode(mail_from, mail_from_encoding)).encode(
-            "ascii", "xmlcharrefreplace"
-        )
-    except Exception:
         mail_subject = decode_string(mail_subject)
+    except Exception:
+        mail_subject = ""
+    try:
         mail_to = decode_string(mail_to)
+    except Exception:
+        mail_to = ""
+    try:
         mail_from = decode_string(mail_from)
+    except Exception:
+        mail_from = ""
 
     mail_number = int(mail_id)
 
@@ -660,14 +666,10 @@ def createMailPage(
     )
 
     try:
-        email_date = str(
-            time.strftime("%d-%m-%Y %H:%m", email.utils.parsedate(mail_date))
-        )
         attachment_folder_date = str(
             time.strftime("%Y/%m/", email.utils.parsedate(mail_date))
         )
     except TypeError:
-        email_date = "Error in Date"
         attachment_folder_date = str("2000/1/")
 
     content_of_mail = {}
@@ -680,14 +682,21 @@ def createMailPage(
         if part_content_type == "text/plain":
             part_decoded_contents = part.get_payload(decode=True)
             try:
-                if part_charset[0]:
-                    content_of_mail["text"] += cgi.escape(
-                        unicode(str(part_decoded_contents), part_charset[0])
-                    ).encode("ascii", "xmlcharrefreplace")
+                # Decode bytes to string using provided charset or fallback
+                if part_decoded_contents is None:
+                    decoded_text = ""
+                elif isinstance(part_decoded_contents, bytes):
+                    if part_charset and part_charset[0]:
+                        try:
+                            decoded_text = part_decoded_contents.decode(part_charset[0], errors="replace")
+                        except Exception:
+                            decoded_text = part_decoded_contents.decode("utf-8", errors="replace")
+                    else:
+                        decoded_text = part_decoded_contents.decode("utf-8", errors="replace")
                 else:
-                    content_of_mail["text"] += cgi.escape(
-                        str(part_decoded_contents)
-                    ).encode("ascii", "xmlcharrefreplace")
+                    decoded_text = str(part_decoded_contents)
+
+                content_of_mail["text"] += html.escape(decoded_text)
             except Exception:
                 try:
                     content_of_mail["text"] += decode_string(part_decoded_contents)
@@ -698,14 +707,20 @@ def createMailPage(
         elif part_content_type == "text/html":
             part_decoded_contents = part.get_payload(decode=True)
             try:
-                if part_charset[0]:
-                    content_of_mail["html"] += unicode(
-                        str(part_decoded_contents), part_charset[0]
-                    ).encode("ascii", "xmlcharrefreplace")
+                if part_decoded_contents is None:
+                    decoded_html = ""
+                elif isinstance(part_decoded_contents, bytes):
+                    if part_charset and part_charset[0]:
+                        try:
+                            decoded_html = part_decoded_contents.decode(part_charset[0], errors="replace")
+                        except Exception:
+                            decoded_html = part_decoded_contents.decode("utf-8", errors="replace")
+                    else:
+                        decoded_html = part_decoded_contents.decode("utf-8", errors="replace")
                 else:
-                    content_of_mail["html"] += str(part_decoded_contents).encode(
-                        "ascii", "xmlcharrefreplace"
-                    )
+                    decoded_html = str(part_decoded_contents)
+
+                content_of_mail["html"] += decoded_html
             except Exception:
                 try:
                     content_of_mail["html"] += decode_string(part_decoded_contents)
@@ -778,7 +793,11 @@ def createMailPage(
                 r"(?i)POSITION: absolute;", "", strip_header, flags=re.DOTALL
             )
             strip_header = re.sub(r"(?i)TOP: .*?;", "", strip_header, flags=re.DOTALL)
-            mail_page.write(decodestring(strip_header))
+            try:
+                # quopri.decodestring expects bytes; ensure bytes and decode back to str
+                mail_page.write(quopri.decodestring(strip_header.encode("utf-8", errors="replace")).decode("utf-8", errors="replace"))
+            except Exception:
+                mail_page.write(strip_header)
             mail_page.write("</pre>\n")
 
         if content_of_mail["html"]:
@@ -798,7 +817,10 @@ def createMailPage(
                 r"(?i)POSITION: absolute;", "", strip_header, flags=re.DOTALL
             )
             strip_header = re.sub(r"(?i)TOP: .*?;", "", strip_header, flags=re.DOTALL)
-            mail_page.write(decodestring(strip_header))
+            try:
+                mail_page.write(quopri.decodestring(strip_header.encode("utf-8", errors="replace")).decode("utf-8", errors="replace"))
+            except Exception:
+                mail_page.write(strip_header)
 
         mail_page.write('<a href="javascript:history.go(-1)">Go back</a>')
 
@@ -837,7 +859,7 @@ def save_mail_attachments_to_folders(mail_id, mail, local_folder, folder):
     for part in mail.walk():
         if part.get_content_maintype() == "multipart":
             continue
-        if part.get("Content-Disposition") == None:
+        if part.get("Content-Disposition") is None:
             continue
         decoded_filename = part.get_filename()
         filename_header = None
@@ -857,7 +879,7 @@ def save_mail_attachments_to_folders(mail_id, mail, local_folder, folder):
             att_filename = re.sub(
                 r"[^.a-zA-Z0-9 :;,\.\?]",
                 "_",
-                decoded_filename.replace(":", "").replace("/", "").replace("\\", ""),
+                (decoded_filename or "").replace(":", "").replace("/", "").replace("\\", ""),
             )
 
         if last_att_filename == att_filename:
@@ -871,25 +893,33 @@ def save_mail_attachments_to_folders(mail_id, mail, local_folder, folder):
         )
         att_dir = os.path.join(folder, att_date, str(mail_id), "attachments")
 
-        att_locs = []
-        with open(att_path, "wb") as att_file:
+        # locations list not used in current implementation
+        payload = part.get_payload(decode=True)
+        try:
+            if payload is None:
+                payload_bytes = b""
+            elif isinstance(payload, bytes):
+                payload_bytes = payload
+            else:
+                # str -> encode
+                payload_bytes = str(payload).encode("utf-8", errors="replace")
+
+            with open(att_path, "wb") as att_file:
+                att_file.write(payload_bytes)
+        except Exception as e:
+            # write an error message into the file as bytes
             try:
-                att_file.write(part.get_payload(decode=True))
-            except Exception as e:
-                att_file.write("Error writing attachment: " + str(e) + ".\n")
-                print("Error writing attachment: " + str(e) + ".\n")
-                return False
-            att_file.close()
+                with open(att_path, "wb") as att_file:
+                    att_file.write(("Error writing attachment: " + str(e) + ".\n").encode("utf-8"))
+            except Exception:
+                pass
+            print("Error writing attachment: " + str(e) + ".\n")
+            return False
 
         with open(att_dir + "/index.html", "a") as att_dir_index:
             att_dir_index.write(
-                '<li><a href="'
-                + str(att_filename)
-                + '">'
-                + str(att_filename)
-                + "</a></li>\n"
+                '<li><a href="' + str(att_filename) + '">' + str(att_filename) + "</a></li>\n"
             )
-            att_dir_index.close()
             returnTrue = True
 
     with open(
