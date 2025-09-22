@@ -314,12 +314,32 @@ def get_messages_to_local_maildir(mailFolder, mail, startid=1):
         print("Saving message %s." % (message_id))
         maildir_folder = mailFolder.replace("/", ".")
         saveToMaildir(raw_email, maildir_folder)
-        if incremental_backup:
-            saveMostRecentMailID(message_id, IMAPLOGIN, mailFolder)
+    # end message loop
+
+
+
+def allFolders(IMAPFOLDER_ORIG, mail):
+    response = []
+    if len(IMAPFOLDER_ORIG) == 1 and IMAPFOLDER_ORIG[0] == "NoPriv_All":
+        maillist = mail.list()
+        for imapFolder in sorted(maillist[1]):
+            # imaplib may return bytes; ensure string
+            if isinstance(imapFolder, bytes):
+                try:
+                    imapFolder = imapFolder.decode("utf-8", errors="replace")
+                except Exception:
+                    imapFolder = imapFolder.decode(errors="replace")
+            imapFolder = re.sub(r"(?i)\(.*\)", "", imapFolder, flags=re.DOTALL)
+            imapFolder = re.sub(r"(?i)\".\"", "", imapFolder, flags=re.DOTALL)
+            imapFolder = re.sub(r"(?i)\"", "", imapFolder, flags=re.DOTALL)
+            imapFolder = imapFolder.strip()
+            response.append(imapFolder)
+    else:
+        response = IMAPFOLDER_ORIG
+    return response
 
 
 def returnIndexPage():
-    global IMAPFOLDER
     global IMAPLOGIN
     global IMAPSERVER
     global ssl
@@ -346,49 +366,20 @@ def returnIndexPage():
         indexFile.write("Folders to backup: <br />\n<ul>\n")
         for folder in IMAPFOLDER:
             indexFile.write(
-                '\t<li><a href = "'
-                + folder
-                + '/email-report-1.html">'
-                + folder
-                + "</a></li>\n"
+                '\t<li><a href = "' + folder + '/email-report-1.html>' + folder + "</a></li>\n"
             )
         indexFile.write("</ul>\n")
         indexFile.write("<br />Available Folders:<br />")
         if not offline:
-            indexFile.write(
-                returnImapFolders(available=True, selected=False, html=True)
-            )
+            indexFile.write(returnImapFolders(available=True, selected=False, html=True))
         if ssl:
-            indexFile.write(
-                "And, you've got a good mail provider, they support SSL and your backup was made over SSL.<br />\n"
-            )
+            indexFile.write("And, you've got a good mail provider, they support SSL and your backup was made over SSL.<br />\n")
         else:
             indexFile.write("No encrption was used when getting the emails.<br />\n")
         indexFile.write("Thats all folks, have a nice day!</p>\n")
         indexFile.write("</div>")
         indexFile.write(returnFooter())
         indexFile.close()
-
-
-def allFolders(IMAPFOLDER_ORIG, mail):
-    response = []
-    if len(IMAPFOLDER_ORIG) == 1 and IMAPFOLDER_ORIG[0] == "NoPriv_All":
-        maillist = mail.list()
-        for imapFolder in sorted(maillist[1]):
-            # imaplib may return bytes; ensure string
-            if isinstance(imapFolder, bytes):
-                try:
-                    imapFolder = imapFolder.decode("utf-8", errors="replace")
-                except Exception:
-                    imapFolder = imapFolder.decode(errors="replace")
-            imapFolder = re.sub(r"(?i)\(.*\)", "", imapFolder, flags=re.DOTALL)
-            imapFolder = re.sub(r"(?i)\".\"", "", imapFolder, flags=re.DOTALL)
-            imapFolder = re.sub(r"(?i)\"", "", imapFolder, flags=re.DOTALL)
-            imapFolder = imapFolder.strip()
-            response.append(imapFolder)
-    else:
-        response = IMAPFOLDER_ORIG
-    return response
 
 
 def returnImapFolders(available=True, selected=True, html=False):
@@ -981,26 +972,89 @@ def backup_mails_to_html_from_local_maildir(folder):
     ## Maildir folders have dots, not slashes
     local_maildir_folder = folder.replace("/", ".")
     local_maildir = mailbox.Maildir(os.path.join(maildir), factory=None, create=True)
+
+    # Try direct lookup first; if it fails, try to find a matching folder name
+    # on disk because Maildir may mangle dotted names (e.g. ".INBOX._mail.sent-mail").
+    maildir_folder = None
+    candidate = None
     try:
         maildir_folder = local_maildir.get_folder(local_maildir_folder)
-    except mailbox.NoSuchMailboxError as e:
-        print(
-            ('Error: Folder "%s" is probably empty or does not exists: %s.')
-            % (folder, e)
-        )
-        createOverviewPage(folder, 1, 0)
-        addMailToOverviewPage(
-            folder,
-            1,
-            1,
-            "-",
-            "-",
-            "Error: Folder/mailbox does not exist or is empty",
-            "01-01-1900",
-            emptyFolder=True,
-        )
-        finishOverviewPage(folder, 1, 0, 0, 0)
-        return None
+    except mailbox.NoSuchMailboxError:
+        # Scan the Maildir on disk for plausible matches and try alternatives
+        maildir_root = os.path.join(maildir)
+        candidate = None
+        try:
+            # More robust matching for nested mailbox names.
+            # Split the target (which uses dots for separators) into components
+            # and normalize each component (remove non-alphanum, lowercase).
+            target_parts = [
+                re.sub(r"[^0-9A-Za-z]", "", p).lower()
+                for p in local_maildir_folder.split(".")
+            ]
+
+            for entry in os.listdir(maildir_root):
+                # skip Maildir control dirs
+                if entry in ("cur", "new", "tmp"):
+                    continue
+                stripped = entry.lstrip(".")
+                entry_parts = stripped.split(".")
+                entry_parts_norm = [
+                    re.sub(r"[^0-9A-Za-z]", "", p).lower() for p in entry_parts
+                ]
+                # Exact per-component normalized match
+                if entry_parts_norm == target_parts:
+                    candidate = stripped
+                    break
+                # Fallback: whole-string normalized match (legacy behavior)
+                if re.sub(r"[^0-9A-Za-z]", "", stripped).lower() == "".join(
+                    target_parts
+                ):
+                    candidate = stripped
+                    break
+        except Exception:
+            candidate = None
+
+        if candidate:
+            try:
+                maildir_folder = local_maildir.get_folder(candidate)
+            except Exception as e:
+                print(("Error opening matched Maildir folder '%s': %s") % (candidate, e))
+                maildir_folder = None
+
+        # If we found a Maildir folder, aggressively regenerate the HTML output
+        # by removing any existing folder on disk. This enforces strict
+        # regeneration from Maildir contents.
+        if maildir_folder is not None:
+            if os.path.isdir(folder):
+                print(("Info: regenerating HTML for '%s' from Maildir (removing existing folder).") % (folder,))
+                try:
+                    remove(folder)
+                except Exception as e:
+                    print(("Warning: failed to remove existing folder '%s': %s") % (folder, e))
+
+        if not candidate or maildir_folder is None:
+            # If an HTML folder with the same name already exists in the repo,
+            # assume it was generated previously and skip Maildir processing.
+            if os.path.isdir(folder):
+                print(("Info: Maildir for '%s' not found, but folder exists on disk; skipping Maildir -> HTML conversion.") % (folder,))
+                return None
+            print(
+                ('Error: Folder "%s" is probably empty or does not exists.')
+                % (folder,)
+            )
+            createOverviewPage(folder, 1, 0)
+            addMailToOverviewPage(
+                folder,
+                1,
+                1,
+                "-",
+                "-",
+                "Error: Folder/mailbox does not exist or is empty",
+                "01-01-1900",
+                emptyFolder=True,
+            )
+            finishOverviewPage(folder, 1, 0, 0, 0)
+            return None
 
     ## Start with the first email
     mail_number = 1
